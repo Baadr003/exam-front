@@ -9,14 +9,15 @@ import { api } from '../services/api';
 import { authService } from '../services/authService';
 import { WebSocketService } from '../services/websocketService';
 import { ALL_CITIES } from '../utils/constants';
+import { checkSession } from '../utils/authUtils';
+import EmailVerificationDialog from '../components/EmailVerificationDialog';
 
-const MainPage = () => {
+const MainPage = ({ isAuthenticated: globalIsAuthenticated, setIsAuthenticated: setGlobalIsAuthenticated, userId: globalUserId, setUserId: setGlobalUserId }) => {
   const [citiesData, setCitiesData] = useState(null);
   const [selectedCity, setSelectedCity] = useState(null);
   const [currentData, setCurrentData] = useState(null);
   const [forecastData, setForecastData] = useState(null);
   const [historyData, setHistoryData] = useState(null);
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [openLogin, setOpenLogin] = useState(false);
   const [openRegister, setOpenRegister] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
@@ -33,35 +34,48 @@ const MainPage = () => {
     message: '',
     aqi: null
   });
+  const [verificationDialog, setVerificationDialog] = useState({
+    open: false,
+    email: ''
+  });
 
+  // Combined session and WebSocket management
   useEffect(() => {
-    if (isAuthenticated) {
-      const wsService = new WebSocketService(localStorage.getItem('userId'));
+    const { isAuthenticated, userId } = checkSession();
+    let wsService = null;
+
+    if (isAuthenticated && userId) {
+      setGlobalIsAuthenticated(true);
+      setGlobalUserId(userId);
+      
+      wsService = new WebSocketService(userId);
       wsService.connect((data) => {
-        setNotification({
-          open: true,
-          message: data.message,
-          aqi: data.aqi
-        });
+        if (data.type === 'ALERT') {
+          setNotification({
+            open: true,
+            message: data.message,
+            aqi: data.aqi,
+            severity: data.priority?.color || 'warning'
+          });
+        }
       });
-      return () => wsService.disconnect();
-    }
-  }, [isAuthenticated]);
 
-  useEffect(() => {
-    if (isAuthenticated) {
-        const wsService = new WebSocketService(localStorage.getItem('userId'));
-        wsService.connect((alert) => {
-            setNotification({
-                open: true,
-                message: alert.message,
-                severity: 'warning'
-            });
-        });
+      // Check session validity periodically
+      const sessionCheckInterval = setInterval(() => {
+        const currentSession = checkSession();
+        if (!currentSession.isAuthenticated) {
+          handleLogout();
+        }
+      }, 60000); // Check every minute
 
-        return () => wsService.disconnect();
+      return () => {
+        clearInterval(sessionCheckInterval);
+        if (wsService) {
+          wsService.disconnect();
+        }
+      };
     }
-}, [isAuthenticated]);
+  }, [setGlobalIsAuthenticated, setGlobalUserId]);
 
   useEffect(() => {
     const fetchAllCitiesData = async () => {
@@ -145,23 +159,20 @@ const MainPage = () => {
     setSelectedCity(city);
   };
 
+  // Enhanced login handler with session management
   const handleLogin = async () => {
     try {
       const response = await authService.login(loginData);
       if (response.success) {
-        setIsAuthenticated(true);
+        setGlobalIsAuthenticated(true);
+        setGlobalUserId(response.userId);
         setOpenLogin(false);
         setError('');
-        localStorage.setItem('userId', response.userId);
-        setNotification({
-          open: true,
-          message: 'Connexion réussie',
-          aqi: 0
-        });
       } else {
         setError(response.message);
       }
     } catch (error) {
+      console.error('Login error:', error);
       setError('Erreur de connexion');
     }
   };
@@ -171,11 +182,15 @@ const MainPage = () => {
       const response = await authService.register(registerData);
       if (response.success) {
         setOpenRegister(false);
+        setVerificationDialog({
+          open: true,
+          email: registerData.email
+        });
         setError('');
         setNotification({
           open: true,
-          message: 'Inscription réussie !',
-          aqi: 0
+          message: 'Inscription réussie ! Veuillez vérifier votre email.',
+          severity: 'success'
         });
       } else {
         setError(response.message);
@@ -185,19 +200,75 @@ const MainPage = () => {
     }
   };
 
+  // Enhanced logout with cleanup
   const handleLogout = () => {
-    setIsAuthenticated(false);
-    localStorage.removeItem('userId');
-    setShowProfile(false);
     authService.logout();
+    setGlobalIsAuthenticated(false);
+    setGlobalUserId(null);
+    setShowProfile(false);
+    setSelectedCity(null);
+    setCurrentData(null);
+    setForecastData(null);
+    setHistoryData(null);
+    setNotification({
+      open: true,
+      message: 'Déconnexion réussie',
+      severity: 'info'
+    });
   };
 
+  // Session check for protected features
   const handleProfileClick = () => {
+    const { isAuthenticated } = checkSession();
+    if (!isAuthenticated) {
+      setNotification({
+        open: true,
+        message: 'Session expirée. Veuillez vous reconnecter.',
+        severity: 'warning'
+      });
+      setGlobalIsAuthenticated(false);
+      setOpenLogin(true);
+      return;
+    }
     setShowProfile(true);
+  };
+
+  // Ajout de la gestion des notifications
+  const handleNotificationClose = (event, reason) => {
+    if (reason === 'clickaway') return;
+    setNotification(prev => ({ ...prev, open: false }));
   };
 
   const handleBackToMap = () => {
     setShowProfile(false);
+  };
+
+  const handleVerifyEmail = async (email, code) => {
+    try {
+      await authService.verifyEmail(email, code);
+      setVerificationDialog({ open: false, email: '' });
+      setNotification({
+        open: true,
+        message: 'Email vérifié avec succès',
+        severity: 'success'
+      });
+      setOpenLogin(true);
+    } catch (error) {
+      setError(error.message);
+    }
+  };
+
+  const handleResendCode = async (email) => {
+    try {
+      await authService.resendVerificationCode(email);
+      setNotification({
+        open: true,
+        message: 'Nouveau code envoyé',
+        severity: 'info'
+      });
+    } catch (error) {
+      setError(error.message);
+    }
   };
 
   return (
@@ -207,7 +278,7 @@ const MainPage = () => {
           <Typography variant="h6" sx={{ flexGrow: 1, color: '#00fff5' }}>
             {showProfile ? 'User Profile' : 'Pollution Map'}
           </Typography>
-          {isAuthenticated ? (
+          {globalIsAuthenticated ? (
             <>
               {showProfile ? (
                 <Button 
@@ -278,7 +349,7 @@ const MainPage = () => {
         open={notification.open}
         message={notification.message}
         aqi={notification.aqi}
-        onClose={() => setNotification(prev => ({ ...prev, open: false }))}
+        onClose={handleNotificationClose}
       />
 
       <Dialog open={openLogin} onClose={() => setOpenLogin(false)}>
@@ -358,7 +429,7 @@ const MainPage = () => {
       </Dialog>
 
       {showProfile ? (
-  <UserProfile userId={localStorage.getItem('userId')} />
+  <UserProfile userId={globalUserId} />
 ) : (
   <Container maxWidth="xl" sx={{ mt: 4, mb: 4 }}>
     <Grid container spacing={3}>
@@ -382,13 +453,21 @@ const MainPage = () => {
           current={currentData}
           forecast={forecastData}
           history={historyData}
-          isAuthenticated={isAuthenticated}
+          isAuthenticated={globalIsAuthenticated}
           isLoading={isLoading}
         />
       </Grid>
     </Grid>
   </Container>
 )}
+
+      <EmailVerificationDialog
+        open={verificationDialog.open}
+        email={verificationDialog.email}
+        onClose={() => setVerificationDialog({ open: false, email: '' })}
+        onVerify={handleVerifyEmail}
+        onResendCode={handleResendCode}
+      />
     </>
   );
 };
